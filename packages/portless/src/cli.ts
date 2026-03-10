@@ -13,19 +13,25 @@ import { syncHostsFile, cleanHostsFile } from "./hosts.js";
 import { FILE_MODE, RouteConflictError, RouteStore } from "./routes.js";
 import { inferProjectName, detectWorktreePrefix } from "./auto.js";
 import {
+  DEFAULT_TLD,
   PRIVILEGED_PORT_THRESHOLD,
+  RISKY_TLDS,
   discoverState,
   findFreePort,
   findPidOnPort,
   getDefaultPort,
+  getDefaultTld,
   injectFrameworkFlags,
   isHttpsEnvEnabled,
   isProxyRunning,
   prompt,
+  readTldFromDir,
   readTlsMarker,
   resolveStateDir,
   spawnCommand,
+  validateTld,
   waitForProxy,
+  writeTldFile,
   writeTlsMarker,
 } from "./cli-utils.js";
 
@@ -52,6 +58,7 @@ const SUDO_SPAWN_TIMEOUT_MS = 30_000;
 function startProxyServer(
   store: RouteStore,
   proxyPort: number,
+  tld: string,
   tlsOptions?: { cert: Buffer; key: Buffer }
 ): void {
   store.ensureDir();
@@ -76,7 +83,11 @@ function startProxyServer(
   let watcher: fs.FSWatcher | null = null;
   let pollingInterval: ReturnType<typeof setInterval> | null = null;
 
-  const autoSyncHosts = process.env.PORTLESS_SYNC_HOSTS === "1";
+  const syncVal = process.env.PORTLESS_SYNC_HOSTS;
+  const autoSyncHosts =
+    syncVal === "1" ||
+    syncVal === "true" ||
+    (tld !== DEFAULT_TLD && syncVal !== "0" && syncVal !== "false");
 
   const reloadRoutes = () => {
     try {
@@ -107,6 +118,7 @@ function startProxyServer(
   const server = createProxyServer({
     getRoutes: () => cachedRoutes,
     proxyPort,
+    tld,
     onError: (msg) => console.error(chalk.red(msg)),
     tls: tlsOptions,
   });
@@ -135,9 +147,11 @@ function startProxyServer(
     fs.writeFileSync(store.pidPath, process.pid.toString(), { mode: FILE_MODE });
     fs.writeFileSync(store.portFilePath, proxyPort.toString(), { mode: FILE_MODE });
     writeTlsMarker(store.dir, isTls);
+    writeTldFile(store.dir, tld);
     fixOwnership(store.dir, store.pidPath, store.portFilePath);
     const proto = isTls ? "HTTPS/2" : "HTTP";
-    console.log(chalk.green(`${proto} proxy listening on port ${proxyPort}`));
+    const tldLabel = tld !== DEFAULT_TLD ? ` (TLD: .${tld})` : "";
+    console.log(chalk.green(`${proto} proxy listening on port ${proxyPort}${tldLabel}`));
   });
 
   // Cleanup on exit
@@ -161,6 +175,7 @@ function startProxyServer(
       // Port file may already be removed; non-fatal
     }
     writeTlsMarker(store.dir, false);
+    writeTldFile(store.dir, DEFAULT_TLD);
     if (autoSyncHosts) cleanHostsFile();
     server.close(() => process.exit(0));
     // Force exit after a short timeout in case connections don't drain
@@ -312,11 +327,27 @@ async function runApp(
   name: string,
   commandArgs: string[],
   tls: boolean,
+  tld: string,
   force: boolean,
   autoInfo?: { nameSource: string; prefix?: string; prefixSource?: string },
   desiredPort?: number
 ) {
-  const hostname = parseHostname(name);
+  const hostname = parseHostname(name, tld);
+
+  let envTld: string;
+  try {
+    envTld = getDefaultTld();
+  } catch (err) {
+    console.error(chalk.red(`Error: ${(err as Error).message}`));
+    process.exit(1);
+  }
+  if (envTld !== DEFAULT_TLD && envTld !== tld) {
+    console.warn(
+      chalk.yellow(
+        `Warning: PORTLESS_TLD=${envTld} but the running proxy uses .${tld}. Using .${tld}.`
+      )
+    );
+  }
 
   console.log(chalk.blue.bold(`\nportless\n`));
   console.log(chalk.gray(`-- ${hostname} (auto-resolves to 127.0.0.1)`));
@@ -361,6 +392,7 @@ async function runApp(
       console.log(chalk.yellow("Starting proxy (requires sudo)..."));
       const startArgs = [process.execPath, process.argv[1], "proxy", "start"];
       if (wantHttps) startArgs.push("--https");
+      if (tld !== DEFAULT_TLD) startArgs.push("--tld", tld);
       const result = spawnSync("sudo", startArgs, {
         stdio: "inherit",
         timeout: SUDO_SPAWN_TIMEOUT_MS,
@@ -376,6 +408,7 @@ async function runApp(
       console.log(chalk.yellow("Starting proxy..."));
       const startArgs = [process.argv[1], "proxy", "start"];
       if (wantHttps) startArgs.push("--https");
+      if (tld !== DEFAULT_TLD) startArgs.push("--tld", tld);
       const result = spawnSync(process.execPath, startArgs, {
         stdio: "inherit",
         timeout: SUDO_SPAWN_TIMEOUT_MS,
@@ -388,8 +421,9 @@ async function runApp(
       }
     }
 
-    // Re-read TLS state after auto-start (proxy may now be running with HTTPS)
+    // Re-read TLS/TLD state after auto-start
     const autoTls = readTlsMarker(stateDir);
+    tld = readTldFromDir(stateDir);
 
     // Wait for proxy to be ready
     if (!(await waitForProxy(defaultPort, undefined, undefined, autoTls))) {
@@ -447,7 +481,7 @@ async function runApp(
       PORT: port.toString(),
       HOST: "127.0.0.1",
       PORTLESS_URL: finalUrl,
-      __VITE_ADDITIONAL_SERVER_ALLOWED_HOSTS: ".localhost",
+      __VITE_ADDITIONAL_SERVER_ALLOWED_HOSTS: `.${tld}`,
     },
     onCleanup: () => {
       try {
@@ -688,6 +722,7 @@ ${chalk.bold("Options:")}
   --key <path>                  Use a custom TLS private key (implies --https)
   --no-tls                      Disable HTTPS (overrides PORTLESS_HTTPS)
   --foreground                  Run proxy in foreground (for debugging)
+  --tld <tld>                   Use a custom TLD instead of .localhost (e.g. test, dev)
   --app-port <number>           Use a fixed port for the app (skip auto-assignment)
   --force                       Override an existing route registered by another process
   --name <name>                 Use <name> as the app name (bypasses subcommand dispatch)
@@ -696,10 +731,11 @@ ${chalk.bold("Options:")}
 ${chalk.bold("Environment variables:")}
   PORTLESS_PORT=<number>        Override the default proxy port (e.g. in .bashrc)
   PORTLESS_APP_PORT=<number>    Use a fixed port for the app (same as --app-port)
-  PORTLESS_HTTPS=1|true         Always enable HTTPS (set in .bashrc / .zshrc)
-  PORTLESS_SYNC_HOSTS=1         Auto-sync /etc/hosts (requires sudo proxy start)
+  PORTLESS_HTTPS=1              Always enable HTTPS (set in .bashrc / .zshrc)
+  PORTLESS_TLD=<tld>            Use a custom TLD (e.g. test, dev; default: localhost)
+  PORTLESS_SYNC_HOSTS=1         Auto-sync /etc/hosts (auto-enabled for custom TLDs)
   PORTLESS_STATE_DIR=<path>     Override the state directory
-  PORTLESS=0 | PORTLESS=skip    Run command directly without proxy
+  PORTLESS=0                    Run command directly without proxy
 
 ${chalk.bold("Child process environment:")}
   PORT                          Ephemeral port the child should listen on
@@ -709,16 +745,14 @@ ${chalk.bold("Child process environment:")}
 ${chalk.bold("Safari / DNS:")}
   .localhost subdomains auto-resolve in Chrome, Firefox, and Edge.
   Safari relies on the system DNS resolver, which may not handle them.
-  If Safari can't find your .localhost URL, run:
+  Auto-syncs /etc/hosts for custom TLDs (e.g. --tld test). For .localhost,
+  set PORTLESS_SYNC_HOSTS=1 to enable. To manually sync:
     ${chalk.cyan("sudo portless hosts sync")}
-  This adds entries to /etc/hosts. Clean up later with:
+  Clean up later with:
     ${chalk.cyan("sudo portless hosts clean")}
-  To auto-sync whenever routes change, set PORTLESS_SYNC_HOSTS=1 and
-  start the proxy with sudo.
 
 ${chalk.bold("Skip portless:")}
   PORTLESS=0 pnpm dev           # Runs command directly without proxy
-  PORTLESS=skip pnpm dev        # Same as above
 
 ${chalk.bold("Reserved names:")}
   run, get, alias, hosts, list, trust, proxy are subcommands and cannot
@@ -810,9 +844,9 @@ ${chalk.bold("Examples:")}
   const name = positional[0];
   const worktree = skipWorktree ? null : detectWorktreePrefix();
   const effectiveName = worktree ? `${worktree.prefix}.${name}` : name;
-  const hostname = parseHostname(effectiveName);
 
-  const { port, tls } = await discoverState();
+  const { port, tls, tld } = await discoverState();
+  const hostname = parseHostname(effectiveName, tld);
   const url = formatUrl(hostname, port, tls);
   // Print bare URL to stdout so it works in $(portless get <name>)
   process.stdout.write(url + "\n");
@@ -836,7 +870,7 @@ ${chalk.bold("Examples:")}
     process.exit(0);
   }
 
-  const { dir } = await discoverState();
+  const { dir, tld } = await discoverState();
   const store = new RouteStore(dir, {
     onWarning: (msg) => console.warn(chalk.yellow(msg)),
   });
@@ -848,7 +882,7 @@ ${chalk.bold("Examples:")}
       console.error(chalk.cyan("  portless alias --remove <name>"));
       process.exit(1);
     }
-    const hostname = parseHostname(aliasName);
+    const hostname = parseHostname(aliasName, tld);
     const routes = store.loadRoutes();
     const existing = routes.find((r) => r.hostname === hostname && r.pid === 0);
     if (!existing) {
@@ -872,7 +906,7 @@ ${chalk.bold("Examples:")}
     process.exit(1);
   }
 
-  const hostname = parseHostname(aliasName);
+  const hostname = parseHostname(aliasName, tld);
   const port = parseInt(aliasPort, 10);
   if (isNaN(port) || port < 1 || port > 65535) {
     console.error(chalk.red(`Error: Invalid port "${aliasPort}". Must be 1-65535.`));
@@ -881,7 +915,7 @@ ${chalk.bold("Examples:")}
 
   const force = args.includes("--force");
   store.addRoute(hostname, port, 0, force);
-  console.log(chalk.green(`Alias registered: ${hostname} -> localhost:${port}`));
+  console.log(chalk.green(`Alias registered: ${hostname} -> 127.0.0.1:${port}`));
 }
 
 async function handleHosts(args: string[]): Promise<void> {
@@ -897,8 +931,8 @@ ${chalk.bold("Usage:")}
   ${chalk.cyan("sudo portless hosts clean")}   Remove portless entries from /etc/hosts
 
 ${chalk.bold("Auto-sync:")}
-  Set PORTLESS_SYNC_HOSTS=1 and start the proxy with sudo to auto-sync
-  /etc/hosts whenever routes change.
+  Auto-enabled for custom TLDs (e.g. --tld test). For .localhost, set
+  PORTLESS_SYNC_HOSTS=1 to enable. Disable with PORTLESS_SYNC_HOSTS=0.
 `);
     process.exit(0);
   }
@@ -975,6 +1009,7 @@ ${chalk.bold("Usage:")}
   ${chalk.cyan("portless proxy start --https")}        Start with HTTP/2 + TLS
   ${chalk.cyan("portless proxy start --foreground")}   Start in foreground (for debugging)
   ${chalk.cyan("portless proxy start -p 80")}          Start on port 80 (requires sudo)
+  ${chalk.cyan("portless proxy start --tld test")}     Use .test instead of .localhost
   ${chalk.cyan("portless proxy stop")}                 Stop the proxy
 `);
     process.exit(isProxyHelp || !args[1] ? 0 : 1);
@@ -1029,6 +1064,43 @@ ${chalk.bold("Usage:")}
   if ((customCertPath && !customKeyPath) || (!customCertPath && customKeyPath)) {
     console.error(chalk.red("Error: --cert and --key must be used together."));
     process.exit(1);
+  }
+
+  // Parse --tld flag
+  let tld: string;
+  try {
+    tld = getDefaultTld();
+  } catch (err) {
+    console.error(chalk.red(`Error: ${(err as Error).message}`));
+    process.exit(1);
+  }
+  const tldIdx = args.indexOf("--tld");
+  if (tldIdx !== -1) {
+    const tldValue = args[tldIdx + 1];
+    if (!tldValue || tldValue.startsWith("-")) {
+      console.error(chalk.red("Error: --tld requires a TLD value (e.g. test, localhost)."));
+      process.exit(1);
+    }
+    tld = tldValue.trim().toLowerCase();
+    const tldErr = validateTld(tld);
+    if (tldErr) {
+      console.error(chalk.red(`Error: ${tldErr}`));
+      process.exit(1);
+    }
+  }
+  const riskyReason = RISKY_TLDS.get(tld);
+  if (riskyReason) {
+    console.warn(chalk.yellow(`Warning: .${tld} -- ${riskyReason}`));
+  }
+
+  const syncDisabled =
+    process.env.PORTLESS_SYNC_HOSTS === "0" || process.env.PORTLESS_SYNC_HOSTS === "false";
+  if (tld !== DEFAULT_TLD && syncDisabled) {
+    console.warn(
+      chalk.yellow(`Warning: .${tld} domains require /etc/hosts entries to resolve to 127.0.0.1.`)
+    );
+    console.warn(chalk.yellow("Hosts sync is disabled. To add entries manually, run:"));
+    console.warn(chalk.cyan("  sudo portless hosts sync"));
   }
 
   // Custom cert/key implies HTTPS
@@ -1127,7 +1199,7 @@ ${chalk.bold("Usage:")}
       tlsOptions = {
         cert,
         key,
-        SNICallback: createSNICallback(stateDir, cert, key),
+        SNICallback: createSNICallback(stateDir, cert, key, tld),
       };
     }
   }
@@ -1135,7 +1207,7 @@ ${chalk.bold("Usage:")}
   // Foreground mode: run the proxy directly in this process
   if (isForeground) {
     console.log(chalk.blue.bold("\nportless proxy\n"));
-    startProxyServer(store, proxyPort, tlsOptions);
+    startProxyServer(store, proxyPort, tld, tlsOptions);
     return;
   }
 
@@ -1161,6 +1233,9 @@ ${chalk.bold("Usage:")}
       } else {
         daemonArgs.push("--https");
       }
+    }
+    if (tld !== DEFAULT_TLD) {
+      daemonArgs.push("--tld", tld);
     }
 
     const child = spawn(process.execPath, daemonArgs, {
@@ -1205,7 +1280,7 @@ async function handleRunMode(args: string[]): Promise<void> {
   const worktree = detectWorktreePrefix();
   const effectiveName = worktree ? `${worktree.prefix}.${inferred.name}` : inferred.name;
 
-  const { dir, port, tls } = await discoverState();
+  const { dir, port, tls, tld } = await discoverState();
   const store = new RouteStore(dir, {
     onWarning: (msg) => console.warn(chalk.yellow(msg)),
   });
@@ -1216,6 +1291,7 @@ async function handleRunMode(args: string[]): Promise<void> {
     effectiveName,
     parsed.commandArgs,
     tls,
+    tld,
     parsed.force,
     { nameSource: inferred.source, prefix: worktree?.prefix, prefixSource: worktree?.source },
     parsed.appPort
@@ -1234,7 +1310,7 @@ async function handleNamedMode(args: string[]): Promise<void> {
     process.exit(1);
   }
 
-  const { dir, port, tls } = await discoverState();
+  const { dir, port, tls, tld } = await discoverState();
   const store = new RouteStore(dir, {
     onWarning: (msg) => console.warn(chalk.yellow(msg)),
   });
@@ -1245,6 +1321,7 @@ async function handleNamedMode(args: string[]): Promise<void> {
     parsed.name,
     parsed.commandArgs,
     tls,
+    tld,
     parsed.force,
     undefined,
     parsed.appPort
@@ -1290,7 +1367,10 @@ async function main() {
       console.error(chalk.cyan("  portless --name <name> <command...>"));
       process.exit(1);
     }
-    const skipPortless = process.env.PORTLESS === "0" || process.env.PORTLESS === "skip";
+    const skipPortless =
+      process.env.PORTLESS === "0" ||
+      process.env.PORTLESS === "false" ||
+      process.env.PORTLESS === "skip";
     if (skipPortless) {
       const { commandArgs } = parseAppArgs(args);
       if (commandArgs.length === 0) {
@@ -1310,8 +1390,10 @@ async function main() {
     args.shift();
   }
 
-  // Skip portless if PORTLESS=0 or PORTLESS=skip
-  const skipPortless = process.env.PORTLESS === "0" || process.env.PORTLESS === "skip";
+  const skipPortless =
+    process.env.PORTLESS === "0" ||
+    process.env.PORTLESS === "false" ||
+    process.env.PORTLESS === "skip";
   if (skipPortless && (isRunCommand || (args.length >= 2 && args[0] !== "proxy"))) {
     const { commandArgs } = isRunCommand ? parseRunArgs(args) : parseAppArgs(args);
     if (commandArgs.length === 0) {
